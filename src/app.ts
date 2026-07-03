@@ -6,7 +6,7 @@ import compression from 'compression';
 import { errorHandler } from './core/middleware/error-handler.js';
 import { requestLogger } from './core/middleware/logger.js';
 import { config } from './config/env.js';
-
+import { createAuthRouter } from './auth/auth.route.js';
 const app: Express = express();
 
 // Security middleware
@@ -39,8 +39,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// API routes will be added here
-// app.use('/api/v1', routes);
+app.use('/api/v1/auth', createAuthRouter());
 
 // Error handling (must be last)
 app.use(errorHandler);
