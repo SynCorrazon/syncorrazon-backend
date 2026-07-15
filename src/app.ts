@@ -7,6 +7,8 @@ import { errorHandler } from './core/middleware/error-handler.js';
 import { requestLogger } from './core/middleware/logger.js';
 import { config } from './config/env.js';
 import { createAuthRouter } from './auth/auth.route.js';
+import { initializeFirebase } from './config/firebase.js';
+
 const app: Express = express();
 
 // Security middleware
@@ -19,7 +21,7 @@ app.use(
     credentials: true,
   })
 );
-
+initializeFirebase();
 // Compression
 app.use(compression());
 
