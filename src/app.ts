@@ -8,6 +8,7 @@ import { requestLogger } from './core/middleware/logger.js';
 import { config } from './config/env.js';
 import { createAuthRouter } from './auth/auth.route.js';
 import { initializeFirebase } from './config/firebase.js';
+import { createRoomsRouter } from './rooms/rooms.route.js';
 
 const app: Express = express();
 
@@ -42,6 +43,7 @@ app.get('/health', (req, res) => {
 });
 
 app.use('/api/v1/auth', createAuthRouter());
+app.use('/api/v1/rooms', createRoomsRouter());
 
 // Error handling (must be last)
 app.use(errorHandler);

@@ -2,12 +2,13 @@ import express from 'express';
 import type { Express } from 'express';
 import { errorHandler } from '../../../core/middleware/error-handler.js';
 import { createAuthRouter } from '../../../auth/auth.route.js';
-
+import { createRoomsRouter } from '../../../rooms/rooms.route.js';
 export function createTestApp(): Express {
   const app = express();
 
   app.use(express.json());
   app.use('/api/v1/auth', createAuthRouter());
+  app.use('/api/v1/rooms', createRoomsRouter());
   app.use(errorHandler);
 
   return app;
