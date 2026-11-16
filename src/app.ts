@@ -6,43 +6,27 @@ import compression from 'compression';
 import { errorHandler } from './core/middleware/error-handler.js';
 import { requestLogger } from './core/middleware/logger.js';
 import { config } from './config/env.js';
+import { authenticate } from './core/middleware/authenticate.js';
+import { roomRouter } from './routes/rooms.js';
 
 const app: Express = express();
+const allowedOrigins = config.corsOrigin.split(',').map((origin) => origin.trim()).filter(Boolean);
 
-// Security middleware
 app.use(helmet());
-
-// CORS
-app.use(
-  cors({
-    origin: config.corsOrigin,
-    credentials: true,
-  })
-);
-
-// Compression
+app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(compression());
-
-// Body parsing
-app.use(express.json());
+app.use(express.json({ limit: '32kb' }));
 app.use(express.urlencoded({ extended: true }));
-
-// Logging
 app.use(requestLogger);
 
-// Health check
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    environment: config.nodeEnv,
-  });
+app.get('/health', (_req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString(), environment: config.nodeEnv });
 });
 
-// API routes will be added here
-// app.use('/api/v1', routes);
+app.get('/api/v1/auth/me', authenticate, (req, res) => {
+  res.json({ success: true, data: { uid: req.auth.uid, email: req.auth.email ?? null } });
+});
+app.use('/api/v1/rooms', roomRouter);
 
-// Error handling (must be last)
 app.use(errorHandler);
-
 export default app;
