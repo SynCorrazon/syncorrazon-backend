@@ -1,20 +1,57 @@
 import { Router } from 'express';
 import { randomInt } from 'node:crypto';
 import { FieldValue, getFirestore } from 'firebase-admin/firestore';
+import '../config/firebase-admin.js';
 import { authenticate, type AuthenticatedRequest } from '../core/middleware/authenticate.js';
 
 export const roomRouter = Router();
 const db = getFirestore();
 const rooms = db.collection('rooms');
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const getUid = (req: AuthenticatedRequest) => req.auth.uid;
+const uidOf = (req: AuthenticatedRequest) => req.user.uid;
 
-function videoIdFromUrl(raw: unknown): string | null {
+type RoomDocument = {
+  roomCode: string;
+  creatorUid: string;
+  participants: string[];
+  videoUrl?: string;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+const toResponseRoom = (id: string, room: FirebaseFirestore.DocumentData) => {
+  const participants = Array.isArray(room.participants) ? room.participants : [];
+  return {
+    id,
+    roomCode: room.roomCode,
+    creatorUid: room.creatorUid,
+    participants,
+    ...(room.videoUrl ? { videoUrl: room.videoUrl } : {}),
+    isActive: Boolean(room.isActive),
+    participantCount: participants.length,
+    createdAt: room.createdAt?.toDate?.()?.toISOString?.() ?? room.createdAt ?? new Date().toISOString(),
+    updatedAt: room.updatedAt?.toDate?.()?.toISOString?.() ?? room.updatedAt ?? new Date().toISOString(),
+  };
+};
+
+const roomRefByParam = async (roomParam: string) => {
+  const normalized = roomParam.trim().toUpperCase();
+  if (/^[A-HJ-NP-Z2-9]{6}$/.test(normalized)) {
+    const snapshot = await rooms.where('roomCode', '==', normalized).limit(1).get();
+    if (!snapshot.empty) return { ref: snapshot.docs[0].ref, snapshot: snapshot.docs[0] };
+  }
+  const ref = rooms.doc(normalized);
+  const snapshot = await ref.get();
+  return { ref, snapshot };
+};
+
+const videoIdFromUrl = (raw: unknown): string | null => {
   if (typeof raw !== 'string' || raw.length > 2048) return null;
   try {
     const url = new URL(raw);
     const host = url.hostname.toLowerCase().replace(/^www\./, '');
-    let id = '';
+    let id = ''; 
     if (host === 'youtu.be') id = url.pathname.split('/').filter(Boolean)[0] ?? '';
     else if (['youtube.com', 'm.youtube.com', 'youtube-nocookie.com'].includes(host)) {
       if (url.pathname === '/watch') id = url.searchParams.get('v') ?? '';
@@ -24,44 +61,58 @@ function videoIdFromUrl(raw: unknown): string | null {
   } catch {
     return null;
   }
-}
+};
 
-function createCode() {
-  return Array.from({ length: 6 }, () => CODE_CHARS[randomInt(CODE_CHARS.length)]).join('');
-}
+const makeRoomCode = () => Array.from({ length: 6 }, () => CODE_CHARS[randomInt(CODE_CHARS.length)]).join('');
+
+const activeRoomsForUser = async (uid: string) => rooms.where('participants', 'array-contains', uid).where('isActive', '==', true).get();
 
 roomRouter.use(authenticate);
 
 roomRouter.post('/', async (req, res, next) => {
   try {
-    const videoId = videoIdFromUrl(req.body?.videoUrl);
-    if (!videoId) {
-      res.status(400).json({ success: false, message: 'Please provide a valid YouTube video URL.' });
+    const videoId = req.body?.videoUrl === undefined ? null : videoIdFromUrl(req.body.videoUrl);
+    if (req.body?.videoUrl !== undefined && !videoId) {
+      res.status(400).json({ success: false, message: 'Please provide a valid YouTube video URL.', code: 'BAD_REQUEST' });
+      return;
+    }
+
+    const uid = uidOf(req as AuthenticatedRequest);
+    const activeRooms = await activeRoomsForUser(uid);
+    if (!activeRooms.empty) {
+      res.status(400).json({ success: false, message: 'You must leave your active room before creating another.', code: 'BAD_REQUEST' });
       return;
     }
 
     let roomCode = '';
-    let ref;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      roomCode = createCode();
-      const candidate = rooms.doc(roomCode);
-      if (!(await candidate.get()).exists) {
-        ref = candidate;
-        break;
-      }
-    }
-    if (!ref) throw new Error('Could not allocate a room code. Please try again.');
+    let response;
+    let created = false;
+    for (let attempt = 0; attempt < 8 && !created; attempt += 1) {
+      roomCode = makeRoomCode();
+      const existing = await rooms.where('roomCode', '==', roomCode).limit(1).get();
+      if (!existing.empty) continue;
 
-    const room = {
-      roomCode,
-      videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
-      videoId,
-      ownerId: getUid(req as AuthenticatedRequest),
-      participantIds: [getUid(req as AuthenticatedRequest)],
-      createdAt: FieldValue.serverTimestamp(),
-    };
-    await ref.create(room);
-    res.status(201).json({ success: true, data: { ...room, createdAt: new Date().toISOString() } });
+      const ref = rooms.doc();
+      const now = new Date().toISOString();
+      const room: RoomDocument = {
+        roomCode,
+        creatorUid: uid,
+        participants: [uid],
+        ...(videoId ? { videoUrl: `https://www.youtube.com/watch?v=${videoId}` } : {}),
+        isActive: true,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await ref.create(room);
+      response = toResponseRoom(ref.id, room);
+      created = true;
+    }
+
+    if (!response) {
+      throw new Error('Could not generate a unique room code. Please try again.');
+    }
+
+    res.status(201).json({ success: true, data: response });
   } catch (error) {
     next(error);
   }
@@ -69,8 +120,9 @@ roomRouter.post('/', async (req, res, next) => {
 
 roomRouter.get('/', async (req, res, next) => {
   try {
-    const snapshot = await rooms.where('participantIds', 'array-contains', getUid(req as AuthenticatedRequest)).get();
-    res.json({ success: true, data: snapshot.docs.map((doc) => ({ ...doc.data(), roomCode: doc.id })) });
+    const snapshot = await rooms.where('participants', 'array-contains', uidOf(req as AuthenticatedRequest)).get();
+    const data = snapshot.docs.map((doc) => toResponseRoom(doc.id, doc.data()));
+    res.json({ success: true, data });
   } catch (error) {
     next(error);
   }
@@ -78,17 +130,20 @@ roomRouter.get('/', async (req, res, next) => {
 
 roomRouter.get('/:roomId', async (req, res, next) => {
   try {
-    const snapshot = await rooms.doc(req.params.roomId.toUpperCase()).get();
+    const { snapshot } = await roomRefByParam(req.params.roomId);
     if (!snapshot.exists) {
-      res.status(404).json({ success: false, message: 'Room not found.' });
+      res.status(404).json({ success: false, message: 'Room not found.', code: 'NOT_FOUND' });
       return;
     }
-    const room = snapshot.data()!;
-    if (!room.participantIds?.includes(getUid(req as AuthenticatedRequest))) {
-      res.status(403).json({ success: false, message: 'Join this room before opening it.' });
+
+    const room = snapshot.data();
+    const participants = Array.isArray(room?.participants) ? room.participants : [];
+    if (!participants.includes(uidOf(req as AuthenticatedRequest))) {
+      res.status(403).json({ success: false, message: 'You are not a participant in this room.', code: 'FORBIDDEN' });
       return;
     }
-    res.json({ success: true, data: { ...room, roomCode: snapshot.id } });
+
+    res.json({ success: true, data: toResponseRoom(snapshot.id, room) });
   } catch (error) {
     next(error);
   }
@@ -96,27 +151,43 @@ roomRouter.get('/:roomId', async (req, res, next) => {
 
 roomRouter.post('/join', async (req, res, next) => {
   try {
-    const code = typeof req.body?.roomCode === 'string' ? req.body.roomCode.trim().toUpperCase() : '';
-    if (!/^[A-HJ-NP-Z2-9]{6}$/.test(code)) {
-      res.status(400).json({ success: false, message: 'Enter a valid 6-character room code.' });
+    const roomCode = typeof req.body?.roomCode === 'string' ? req.body.roomCode.trim().toUpperCase() : '';
+    if (!/^[A-HJ-NP-Z2-9]{6}$/.test(roomCode)) {
+      res.status(400).json({ success: false, message: 'Enter a valid 6-character room code.', code: 'BAD_REQUEST' });
       return;
     }
-    const ref = rooms.doc(code);
+
+    const uid = uidOf(req as AuthenticatedRequest);
+    const matching = await rooms.where('roomCode', '==', roomCode).limit(1).get();
+    if (matching.empty) {
+      res.status(404).json({ success: false, message: 'Room not found.', code: 'NOT_FOUND' });
+      return;
+    }
+
+    const ref = matching.docs[0].ref;
     const result = await db.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(ref);
-      if (!snapshot.exists) return { error: 'Room not found.' as const };
+      if (!snapshot.exists) return { error: 'Room not found', status: 404 } as const;
       const room = snapshot.data()!;
-      const uid = getUid(req as AuthenticatedRequest);
-      const participants: string[] = room.participantIds ?? [];
-      if (!participants.includes(uid) && participants.length >= 2) return { error: 'This room is full.' as const };
-      if (!participants.includes(uid)) transaction.update(ref, { participantIds: [...participants, uid] });
-      return { room: { ...room, roomCode: code } };
+      const participants = Array.isArray(room.participants) ? room.participants : [];
+      if (!room.isActive) return { error: 'This room is no longer active.', status: 404 } as const;
+      if (participants.includes(uid)) return { data: toResponseRoom(snapshot.id, room) } as const;
+
+      const otherActiveRooms = await transaction.get(rooms.where('participants', 'array-contains', uid).where('isActive', '==', true));
+      if (!otherActiveRooms.empty) return { error: 'Leave your current active room before joining another.', status: 400 } as const;
+      if (participants.length >= 2) return { error: 'This room is full.', status: 400 } as const;
+
+      const updated = { ...room, participants: [...participants, uid], updatedAt: new Date().toISOString() };
+      transaction.update(ref, { participants: updated.participants, updatedAt: updated.updatedAt });
+      return { data: toResponseRoom(snapshot.id, updated) } as const;
     });
+
     if ('error' in result) {
-      res.status(result.error === 'Room not found.' ? 404 : 409).json({ success: false, message: result.error });
+      res.status(result.status).json({ success: false, message: result.error, code: result.status === 404 ? 'NOT_FOUND' : 'BAD_REQUEST' });
       return;
     }
-    res.json({ success: true, data: result.room });
+
+    res.json({ success: true, data: result.data });
   } catch (error) {
     next(error);
   }
@@ -124,14 +195,58 @@ roomRouter.post('/join', async (req, res, next) => {
 
 roomRouter.post('/:roomId/leave', async (req, res, next) => {
   try {
-    const ref = rooms.doc(req.params.roomId.toUpperCase());
-    await db.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(ref);
-      if (!snapshot.exists) return;
-      const participants: string[] = snapshot.data()?.participantIds ?? [];
-      transaction.update(ref, { participantIds: participants.filter((uid) => uid !== getUid(req as AuthenticatedRequest)) });
+    const { ref, snapshot } = await roomRefByParam(req.params.roomId);
+    if (!snapshot.exists) {
+      res.status(404).json({ success: false, message: 'Room not found.', code: 'NOT_FOUND' });
+      return;
+    }
+
+    const uid = uidOf(req as AuthenticatedRequest);
+    const result = await db.runTransaction(async (transaction) => {
+      const current = await transaction.get(ref);
+      if (!current.exists) return null;
+      const room = current.data()!;
+      const participants = Array.isArray(room.participants) ? room.participants : [];
+      const remaining = participants.filter((participantUid) => participantUid !== uid);
+      const isActive = remaining.length > 0 && Boolean(room.isActive);
+      const updatedAt = new Date().toISOString();
+      transaction.update(ref, {
+        participants: remaining,
+        isActive,
+        updatedAt,
+        ...(isActive ? {} : { deactivatedAt: FieldValue.serverTimestamp() }),
+      });
+      return toResponseRoom(current.id, { ...room, participants: remaining, isActive, updatedAt });
     });
-    res.json({ success: true });
+
+    if (!result) {
+      res.status(404).json({ success: false, message: 'Room not found.', code: 'NOT_FOUND' });
+      return;
+    }
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+roomRouter.delete('/:roomId', async (req, res, next) => {
+  try {
+    const { ref, snapshot } = await roomRefByParam(req.params.roomId);
+    if (!snapshot.exists) {
+      res.status(404).json({ success: false, message: 'Room not found.', code: 'NOT_FOUND' });
+      return;
+    }
+
+    const uid = uidOf(req as AuthenticatedRequest);
+    const room = snapshot.data()!;
+    if (room.creatorUid !== uid) {
+      res.status(403).json({ success: false, message: 'Only the room creator can delete it.', code: 'FORBIDDEN' });
+      return;
+    }
+
+    await ref.update({ isActive: false, updatedAt: new Date().toISOString(), deletedAt: FieldValue.serverTimestamp() });
+    res.json({ success: true, data: { message: 'Room deactivated successfully.' } });
   } catch (error) {
     next(error);
   }

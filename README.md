@@ -1,30 +1,48 @@
-# SynCorrazon backend
+# SynCorrazon Backend
 
-Firebase-authenticated API for SynCorrazon watch rooms. Firebase Authentication remains the identity provider; Firestore stores room metadata and membership. Passwords and Firebase service-account credentials are never stored in this repository.
+The API verifies Firebase ID tokens and owns profile and room data in Firestore. The browser sends a Firebase ID token in the `Authorization: Bearer <token>` header for every protected endpoint; the backend verifies it and stores profile/room data there. Passwords stay in Firebase Auth.
 
-## Run locally
+## Local setup
 
-1. Install Node.js 18+ and npm.
-2. In Firebase Console, create/select the project, enable Authentication providers used by the frontend, and create a Firestore database.
-3. Create a Firebase service account with the minimum Firestore access needed. Keep its credentials private.
-4. Copy `env.example` to `.env`, set the Firebase service-account values, and set `CORS_ORIGIN=http://localhost:3000` (add any other exact origins as comma-separated values).
-5. Run `npm ci`, then `npm run dev`. The API listens on port 3000 by default; `GET /health` checks availability.
+- Node.js 18+
+- Firebase project with Authentication enabled and Firestore initialized
+- Firebase Admin service-account credentials kept private
 
-## API
+Copy `env.example` to `.env`, set `PORT`, `CORS_ORIGIN`, and your Firebase Admin values, then run:
 
-Every `/api/v1` endpoint other than health requires `Authorization: Bearer <Firebase ID token>`. The API verifies tokens with Firebase Admin SDK.
+```bash
+npm ci
+npm run dev
+```
 
-- `GET /api/v1/auth/me` — current verified account UID/email.
-- `POST /api/v1/rooms` with `{ "videoUrl": "https://youtu.be/VIDEO_ID" }` — create a room.
-- `GET /api/v1/rooms` — list rooms the account belongs to.
-- `GET /api/v1/rooms/:roomCode` — retrieve room metadata for a member.
-- `POST /api/v1/rooms/join` with `{ "roomCode": "ABC234" }` — join a room (two participants maximum).
-- `POST /api/v1/rooms/:roomCode/leave` — leave without deleting the user's account.
+Use `GET /health` to confirm the server is running.
 
-Room records are stored in Firestore's `rooms` collection. Do not expose service-account credentials or disable Firestore security controls. Configure Firestore rules to deny direct client writes to `rooms`; only this trusted backend should write room membership.
+## Auth contract
 
-## Deployment
+- `POST /api/v1/auth` with `{ "idToken": "<Firebase ID token>" }` verifies the user and creates/updates the backend-owned profile.
+- `GET /api/v1/auth/me` requires a valid Bearer ID token and returns the current profile.
 
-Deploy the Node service (for example, Render) with `npm ci` and `npm run build`; start with `npm start`. Configure `NODE_ENV`, `PORT` (provided by host), `CORS_ORIGIN` (the exact deployed frontend origin), `FIREBASE_PROJECT_ID`, `FIREBASE_PRIVATE_KEY` (preserve newlines or use `\n`), and `FIREBASE_CLIENT_EMAIL` as host-side secrets/environment settings. Never commit `.env` or service-account JSON.
+## Room contract
 
-The Socket.IO server is currently initialized, but peer signaling/playback relay is not implemented here; room creation, membership, and room metadata APIs are implemented. YouTube embedding availability remains subject to YouTube's restrictions and each video's owner settings.
+All `/api/v1/rooms` routes are token-protected and return JSON in the documented `success/data` format.
+
+- `POST /api/v1/rooms` with optional `{ "videoUrl": "https://youtu.be/..." }` creates a room.
+- `GET /api/v1/rooms` lists the rooms the logged-in user belongs to.
+- `GET /api/v1/rooms/:roomId` returns room details for a participant. The path may be the room document ID or the room code.
+- `POST /api/v1/rooms/join` with `{ "roomCode": "ABC234" }` joins a room.
+- `POST /api/v1/rooms/:roomId/leave` removes the user from a room.
+- `DELETE /api/v1/rooms/:roomId` soft-deactivates a room; only the creator may delete it.
+
+The room response includes `id`, `roomCode`, `creatorUid`, `participants`, optional `videoUrl`, `isActive`, `participantCount`, `createdAt`, and `updatedAt`. The total room count for a user should be filtered from the room list using `creatorUid`; the participant count is in `participantCount`.
+
+## Security and deployment
+
+- Firebase Auth remains the account identity layer; do not store passwords in backend-owned Firestore collections.
+- Use Firebase Admin credentials only in host environment variables; do not commit `.env` or service account JSON.
+- Set `CORS_ORIGIN` to the exact frontend origin and add that hostname to Firebase Authentication authorized domains.
+- Restrict Firestore rules so the browser cannot directly write to `rooms` or `users`.
+- Deploy the backend with `npm ci && npm run build`, then start with `npm start`.
+
+## Known limits
+
+The backend owns room metadata in Firestore, but peer-sync signaling and full multi-user sync logic are still not production-complete. The embedded YouTube player is also at the mercy of YouTube’s own embedding restrictions.
